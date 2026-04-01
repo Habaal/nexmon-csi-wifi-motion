@@ -158,6 +158,39 @@ SCRIPT
     log "systemd-Service konfiguriert."
 }
 
+configure_autoupdate() {
+    log "Richte Auto-Update-Service ein (alle 5 Minuten)..."
+
+    install -m 755 "$(dirname "$0")/autoupdate.sh" /usr/local/bin/nexmon-autoupdate.sh
+
+    # systemd timer statt cron
+    cat > /etc/systemd/system/nexmon-autoupdate.service <<EOF
+[Unit]
+Description=Nexmon CSI Auto-Update
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/nexmon-autoupdate.sh
+EOF
+
+    cat > /etc/systemd/system/nexmon-autoupdate.timer <<EOF
+[Unit]
+Description=Nexmon CSI Auto-Update alle 5 Minuten
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now nexmon-autoupdate.timer
+    log "Auto-Update aktiv. Logs: /var/log/nexmon-autoupdate.log"
+}
+
 restore_firmware() {
     FW="/lib/firmware/brcm/brcmfmac43455-sdio.bin"
     [ -f "${FW}.orig" ] || error "Kein Firmware-Backup gefunden!"
@@ -177,6 +210,7 @@ print_summary() {
     echo "  4. Motion Detection:   python3 src/motion_detection.py --live"
     echo ""
     echo "  Logs: $LOG_FILE"
+    echo "  Auto-Update: alle 5 Min via systemd timer"
 }
 
 case "${1:-install}" in
@@ -186,6 +220,7 @@ case "${1:-install}" in
         clone_nexmon; clone_nexmon_csi
         build_nexmon; build_nexmon_csi
         install_nexmon_csi; configure_monitor_service
+        configure_autoupdate
         print_summary
         ;;
     restore)
