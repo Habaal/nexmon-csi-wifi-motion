@@ -1,0 +1,6 @@
+data/*.csv
+data/*.pcap
+__pycache__/
+*.pyc
+*.pyo
+.env
