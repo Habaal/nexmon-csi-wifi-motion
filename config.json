@@ -1,0 +1,34 @@
+{
+  "wifi": {
+    "interface": "wlan0",
+    "channel": 6,
+    "bandwidth": 80
+  },
+  "detection": {
+    "threshold": 15.0,
+    "baseline_window": 100,
+    "detection_window": 10,
+    "cooldown_frames": 30,
+    "pca_components": 5,
+    "bandpass_low_hz": 0.1,
+    "bandpass_high_hz": 2.0,
+    "sample_rate_hz": 100,
+    "hampel_window": 5,
+    "hampel_sigma": 3.0
+  },
+  "server": {
+    "host": "0.0.0.0",
+    "port": 5000
+  },
+  "notifications": {
+    "opchat_enabled": false,
+    "opchat_url": "",
+    "opchat_room": "",
+    "opchat_token": "",
+    "cooldown_seconds": 30
+  },
+  "logging": {
+    "level": "INFO",
+    "file": "/var/log/nexmon-motion.log"
+  }
+}

@@ -1,267 +1,213 @@
-#!/usr/bin/env python3
 """
 WiFi Motion Detection via Nexmon CSI
-Erkennt Bewegungen anhand von Veränderungen in CSI-Amplituden (BCM43455).
-
-Algorithmus:
-  1. CSI-Amplituden (Subcarrier-Magnituden) einlesen
-  2. Gleitender Mittelwert über Baseline-Fenster als Referenz
-  3. Aktuelles Fenster per PCA projizieren
-  4. L2-Abstand zur Baseline > Schwellwert → Bewegung erkannt
+Erkennt Bewegungen anhand von CSI-Amplituden-Veränderungen.
 
 Verwendung:
-  Echtzeit:    sudo python3 motion_detection.py --live
-  Offline:     python3 motion_detection.py --input csi_data.csv --plot
+  sudo python3 motion_detection.py --live
+  python3 motion_detection.py --input csi_data.csv --plot
 """
 
-import argparse
-import csv
-import socket
-import struct
-import time
-import threading
-import sys
-from collections import deque
+import argparse, csv, json, logging, os, signal, socket, sys, time, threading
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
+from csi_parser import parse as parse_frame
+from signal_processing import CSIPipeline
 
-# ── Standardkonfiguration ─────────────────────────────────────────────────────
-CSI_UDP_PORT     = 5500
-NEXMON_MAGIC     = 0x11111111
-HEADER_SIZE      = 19
-BASELINE_WINDOW  = 100    # Frames für Ruhe-Referenz
-DETECTION_WINDOW = 10     # Frames für aktuellen Zustand
-MOTION_THRESHOLD = 15.0   # Erkennungsschwelle (CSI-Amplituden-Einheiten)
-COOLDOWN_FRAMES  = 30     # Min. Abstand zwischen zwei Ereignissen
-PCA_COMPONENTS   = 5      # Hauptkomponenten für PCA-Projektion
-# ─────────────────────────────────────────────────────────────────────────────
+CSI_UDP_PORT = 5500
 
+def load_config(path="config.json"):
+    cfg_path = Path(__file__).parent.parent / path
+    return json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
 
-class CSIBuffer:
-    def __init__(self, maxlen: int):
-        self._buf: deque[np.ndarray] = deque(maxlen=maxlen)
-        self._lock = threading.Lock()
-
-    def append(self, amp: np.ndarray):
-        with self._lock:
-            self._buf.append(amp)
-
-    def matrix(self) -> np.ndarray | None:
-        with self._lock:
-            return np.array(self._buf) if self._buf else None
-
-    def __len__(self):
-        with self._lock:
-            return len(self._buf)
-
-    @property
-    def maxlen(self):
-        return self._buf.maxlen
+def setup_logging(cfg):
+    log_cfg = cfg.get("logging", {})
+    level   = getattr(logging, log_cfg.get("level", "INFO"))
+    log_file = log_cfg.get("file", "/var/log/nexmon-motion.log")
+    handlers = [logging.StreamHandler()]
+    try:    handlers.append(logging.FileHandler(log_file))
+    except PermissionError: pass
+    logging.basicConfig(level=level,
+        format="%(asctime)s [%(levelname)s] %(message)s", handlers=handlers)
 
 
-def parse_frame(raw: bytes) -> np.ndarray | None:
-    if len(raw) < HEADER_SIZE + 4:
-        return None
-    if struct.unpack_from("<I", raw, 0)[0] != NEXMON_MAGIC:
-        return None
-    payload = raw[HEADER_SIZE:]
-    n = len(payload) // 4
-    iq = np.frombuffer(payload[: n * 4], dtype="<i2").reshape(n, 2).astype(float)
-    return np.hypot(iq[:, 0], iq[:, 1])
+# ── OPCHAT-Benachrichtigung ───────────────────────────────────────────────────
 
+class OpchatNotifier:
+    def __init__(self, cfg):
+        n = cfg.get("notifications", {})
+        self.enabled  = n.get("opchat_enabled", False)
+        self.url      = n.get("opchat_url", "")
+        self.room     = n.get("opchat_room", "")
+        self.token    = n.get("opchat_token", "")
+        self.cooldown = n.get("cooldown_seconds", 30)
+        self._last    = 0
+
+    def notify(self, event):
+        if not self.enabled or not self.url: return
+        if time.time() - self._last < self.cooldown: return
+        try:
+            import urllib.request
+            msg = f"Bewegung erkannt! Score: {event['score']:.1f} | {event['timestamp']}"
+            data = json.dumps({"room": self.room, "message": msg,
+                               "token": self.token}).encode()
+            req  = urllib.request.Request(self.url, data=data,
+                     headers={"Content-Type": "application/json"}, method="POST")
+            urllib.request.urlopen(req, timeout=5)
+            self._last = time.time()
+            logging.info("OPCHAT-Benachrichtigung gesendet.")
+        except Exception as e:
+            logging.warning(f"OPCHAT notify fehlgeschlagen: {e}")
+
+
+# ── Bewegungsdetektor ─────────────────────────────────────────────────────────
 
 class MotionDetector:
-    def __init__(
-        self,
-        threshold: float = MOTION_THRESHOLD,
-        baseline_window: int = BASELINE_WINDOW,
-        detection_window: int = DETECTION_WINDOW,
-        cooldown: int = COOLDOWN_FRAMES,
-        on_motion=None,
-    ):
-        self.threshold = threshold
-        self._bl = CSIBuffer(maxlen=baseline_window)
-        self._det = CSIBuffer(maxlen=detection_window)
-        self._cooldown = cooldown
-        self._since_event = cooldown
-        self._on_motion = on_motion
-        self.events: list[dict] = []
+    def __init__(self, cfg, on_motion=None):
+        det = cfg.get("detection", {})
+        self._pipeline = CSIPipeline(
+            baseline_window  = det.get("baseline_window", 100),
+            detection_window = det.get("detection_window", 10),
+            pca_components   = det.get("pca_components", 5),
+            bandpass_low     = det.get("bandpass_low_hz", 0.1),
+            bandpass_high    = det.get("bandpass_high_hz", 2.0),
+            sample_rate      = det.get("sample_rate_hz", 100.0),
+            hampel_window    = det.get("hampel_window", 5),
+            hampel_sigma     = det.get("hampel_sigma", 3.0),
+        )
+        self.threshold   = det.get("threshold", 15.0)
+        self.cooldown    = det.get("cooldown_frames", 30)
+        self._since      = self.cooldown
+        self._on_motion  = on_motion
         self.frame_count = 0
         self.scores: list[float] = []
+        self.events: list[dict]  = []
+        self._lock = threading.Lock()
 
-    def feed(self, amp: np.ndarray) -> bool:
-        self.frame_count += 1
-        self._bl.append(amp)
-        self._det.append(amp)
-        self._since_event += 1
+    def feed(self, amplitudes: np.ndarray) -> bool:
+        with self._lock:
+            self.frame_count += 1
+            self._since += 1
+            score = self._pipeline.push(amplitudes) or 0.0
+            self.scores.append(score)
+            detected = score > self.threshold and self._since >= self.cooldown
+            if detected:
+                self._since = 0
+                event = {"timestamp": datetime.now().isoformat(),
+                         "frame": self.frame_count, "score": round(score, 2)}
+                self.events.append(event)
+                if self._on_motion:
+                    threading.Thread(target=self._on_motion,
+                                     args=(event,), daemon=True).start()
+            return detected
 
-        if len(self._bl) < self._bl.maxlen // 2:
-            self.scores.append(0.0)
-            return False
-
-        bl_mat  = self._bl.matrix()
-        det_mat = self._det.matrix()
-        bl_mean = bl_mat.mean(axis=0)
-
-        n_comp = min(PCA_COMPONENTS, bl_mat.shape[1])
-        if n_comp >= 2:
-            centered = bl_mat - bl_mean
-            cov = np.cov(centered.T)
-            _, vecs = np.linalg.eigh(cov)
-            top = vecs[:, np.argsort(np.linalg.eigh(cov)[0])[::-1][:n_comp]]
-            bl_proj  = (bl_mat  - bl_mean) @ top
-            det_proj = (det_mat - bl_mean) @ top
-        else:
-            bl_proj  = bl_mat  - bl_mean
-            det_proj = det_mat - bl_mean
-
-        score = float(np.linalg.norm(det_proj.mean(0) - bl_proj.mean(0)))
-        self.scores.append(score)
-
-        if score > self.threshold and self._since_event >= self._cooldown:
-            self._since_event = 0
-            event = {
-                "timestamp": datetime.now().isoformat(),
-                "frame": self.frame_count,
-                "score": score,
-            }
-            self.events.append(event)
-            if self._on_motion:
-                self._on_motion(event)
-            return True
-        return False
+    def status(self) -> dict:
+        with self._lock:
+            score = self.scores[-1] if self.scores else 0.0
+            return {"frame": self.frame_count, "score": round(score, 2),
+                    "threshold": self.threshold, "motion": score > self.threshold,
+                    "events_total": len(self.events),
+                    "last_event": self.events[-1] if self.events else None}
 
 
 # ── Live-Modus ────────────────────────────────────────────────────────────────
 
-def live_mode(threshold: float, verbose: bool):
-    def on_motion(e):
-        print(f"\n*** BEWEGUNG ERKANNT | Score: {e['score']:.1f} | {e['timestamp']} ***")
+def live_mode(cfg):
+    notifier = OpchatNotifier(cfg)
 
-    detector = MotionDetector(threshold=threshold, on_motion=on_motion)
+    def on_motion(event):
+        logging.warning(f"BEWEGUNG | Score: {event['score']} | {event['timestamp']}")
+        notifier.notify(event)
 
+    detector = MotionDetector(cfg, on_motion=on_motion)
+    port = int(os.environ.get("CSI_PORT", CSI_UDP_PORT))
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("0.0.0.0", CSI_UDP_PORT))
+    sock.bind(("0.0.0.0", port))
     sock.settimeout(1.0)
-
-    print(f"[*] Live Motion Detection | Port {CSI_UDP_PORT} | Schwelle: {threshold}")
-    print("[*] Strg+C zum Beenden\n")
+    logging.info(f"Motion Detector | Port {port} | Schwelle: {detector.threshold}")
 
     running = [True]
-    import signal
     signal.signal(signal.SIGINT,  lambda s, f: running.__setitem__(0, False))
     signal.signal(signal.SIGTERM, lambda s, f: running.__setitem__(0, False))
 
     try:
         while running[0]:
-            try:
-                data, _ = sock.recvfrom(4096)
-            except socket.timeout:
-                continue
-            amp = parse_frame(data)
-            if amp is None:
-                continue
-            detector.feed(amp)
-            if detector.frame_count % 20 == 0:
-                score = detector.scores[-1] if detector.scores else 0.0
-                bl_fill = len(detector._bl)
-                status = "BEWEGUNG" if score > threshold else "Ruhig   "
-                print(
-                    f"\r[Frame {detector.frame_count:6d}] "
-                    f"Baseline: {bl_fill:3d}/{detector._bl.maxlen} | "
-                    f"Score: {score:7.2f} | "
-                    f"Ereignisse: {len(detector.events):3d} | {status}",
-                    end="", flush=True,
-                )
+            try: data, _ = sock.recvfrom(4096)
+            except socket.timeout: continue
+            frame = parse_frame(data)
+            if frame is None: continue
+            detector.feed(np.array(frame.amplitudes))
+            if detector.frame_count % 25 == 0:
+                s = detector.status()
+                status = "BEWEGUNG" if s["motion"] else "Ruhig   "
+                print(f"\r[{s['frame']:6d}] Score: {s['score']:7.2f} | "
+                      f"Ereignisse: {s['events_total']:3d} | {status}",
+                      end="", flush=True)
     finally:
         sock.close()
-        print(f"\n[+] Beendet. {len(detector.events)} Ereignisse erkannt.")
+        logging.info(f"Beendet. {len(detector.events)} Ereignisse.")
+    return detector
 
 
 # ── Offline-Analyse ──────────────────────────────────────────────────────────
 
-def offline_mode(input_path: str, threshold: float, plot: bool):
-    print(f"[*] Analysiere: {input_path}")
+def offline_mode(input_path, cfg, plot):
+    logging.info(f"Analysiere: {input_path}")
     timestamps, amps_list = [], []
-
     with open(input_path, newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
+        for row in csv.DictReader(f):
             try:
                 n = int(row["num_subcarriers"])
-                amp = np.array([float(row.get(f"amp_{i}", 0)) for i in range(n)])
+                amps_list.append(np.array([float(row.get(f"amp_{i}", 0)) for i in range(n)]))
                 timestamps.append(float(row["timestamp"]))
-                amps_list.append(amp)
-            except (KeyError, ValueError):
-                continue
+            except (KeyError, ValueError): continue
+    if not amps_list: logging.error("Keine Daten."); return
+    logging.info(f"{len(amps_list)} Frames, {amps_list[0].shape[0]} Subcarrier")
 
-    if not amps_list:
-        print("[!] Keine gültigen Daten gefunden.")
-        return
+    detector = MotionDetector(cfg)
+    motion_frames = [i for i, a in enumerate(amps_list) if detector.feed(a)]
 
-    print(f"[*] {len(amps_list)} Frames, {amps_list[0].shape[0]} Subcarrier")
-
-    detector = MotionDetector(threshold=threshold)
-    motion_frames = []
-    for i, amp in enumerate(amps_list):
-        if detector.feed(amp):
-            motion_frames.append(i)
-
-    print(f"\n[+] Ergebnis:")
-    print(f"    Schwellwert:          {threshold}")
-    print(f"    Bewegungsereignisse:  {len(detector.events)}")
+    print(f"\n=== Ergebnis ===")
+    print(f"Bewegungsereignisse: {len(detector.events)}")
     for e in detector.events:
-        print(f"      Frame {e['frame']:5d} | Score {e['score']:7.2f} | {e['timestamp']}")
-
-    if plot:
-        _plot(timestamps, detector.scores, motion_frames, threshold)
+        print(f"  Frame {e['frame']:5d} | Score {e['score']:7.2f} | {e['timestamp']}")
+    if plot: _plot(timestamps, detector.scores, motion_frames, detector.threshold)
 
 
 def _plot(timestamps, scores, motion_frames, threshold):
-    try:
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("[!] matplotlib fehlt: pip3 install matplotlib")
-        return
-
+    try: import matplotlib.pyplot as plt
+    except ImportError: print("[!] pip3 install matplotlib"); return
     t = np.array(timestamps) - timestamps[0]
-    fig, ax = plt.subplots(figsize=(12, 4))
-    fig.suptitle("WiFi Motion Detection – CSI Score-Verlauf")
-    ax.plot(t[: len(scores)], scores, color="steelblue", lw=0.8, label="Score")
+    fig, ax = plt.subplots(figsize=(14, 4))
+    ax.fill_between(t[:len(scores)], scores, alpha=0.25, color="steelblue")
+    ax.plot(t[:len(scores)], scores, color="steelblue", lw=0.9, label="Score")
     ax.axhline(threshold, color="red", ls="--", label=f"Schwelle ({threshold})")
     for mf in motion_frames:
-        if mf < len(t):
-            ax.axvline(t[mf], color="orange", alpha=0.5, lw=1)
-    ax.set_xlabel("Zeit (s)")
-    ax.set_ylabel("Bewegungs-Score")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.show()
+        if mf < len(t): ax.axvline(t[mf], color="orange", alpha=0.7, lw=1.2)
+    ax.set_xlabel("Zeit (s)"); ax.set_ylabel("Bewegungs-Score")
+    ax.legend(); ax.grid(True, alpha=0.3); plt.tight_layout(); plt.show()
 
-
-# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="WiFi Motion Detection via Nexmon CSI")
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--live",  action="store_true", help="Echtzeit-Erkennung per UDP")
-    mode.add_argument("--input", help="CSV-Datei für Offline-Analyse")
-    parser.add_argument("--threshold", type=float, default=MOTION_THRESHOLD)
-    parser.add_argument("--plot", action="store_true")
-    parser.add_argument("--verbose", action="store_true")
+    mode.add_argument("--live",  action="store_true")
+    mode.add_argument("--input", help="CSV-Datei")
+    parser.add_argument("--config",    default="config.json")
+    parser.add_argument("--threshold", type=float)
+    parser.add_argument("--plot",      action="store_true")
     args = parser.parse_args()
 
-    if args.live:
-        live_mode(args.threshold, args.verbose)
-    elif args.input:
-        offline_mode(args.input, args.threshold, args.plot)
-    else:
-        parser.print_help()
-        sys.exit(1)
+    cfg = load_config(args.config)
+    if args.threshold:
+        cfg.setdefault("detection", {})["threshold"] = args.threshold
+    setup_logging(cfg)
 
+    if args.live:       live_mode(cfg)
+    elif args.input:    offline_mode(args.input, cfg, args.plot)
+    else:               parser.print_help(); sys.exit(1)
 
 if __name__ == "__main__":
     main()

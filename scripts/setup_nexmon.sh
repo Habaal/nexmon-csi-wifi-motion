@@ -228,3 +228,13 @@ case "${1:-install}" in
     *)
         echo "Verwendung: $0 [install|restore]"; exit 1 ;;
 esac
+
+install_python_requirements() {
+    log "Installiere Python-Pakete..."
+    pip3 install --quiet \
+        numpy scipy matplotlib \
+        flask flask-socketio \
+        scapy \
+        2>&1 | tee -a "$LOG_FILE"
+    log "Python-Pakete installiert."
+}
